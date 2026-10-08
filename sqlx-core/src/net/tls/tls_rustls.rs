@@ -67,7 +67,23 @@ impl<S: Socket> Socket for RustlsSocket<S> {
     }
 
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_complete_io(cx)
+        // Write out the TLS records pending, and nothing more: once nothing is
+        // left to write, `poll_complete_io` reads, and waits until the peer
+        // speaks. `BufferedSocket::shutdown` always flushes first, so a close
+        // whose peer had nothing more to say, such as a pooler that sent its
+        // last answers with an error, never ended, holding its pool slot.
+        while self.state.wants_write() {
+            match self.state.write_tls(&mut self.inner) {
+                // The transport takes no more, as `complete_io` reads it.
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    futures_util::ready!(self.inner.poll_ready(cx))?;
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        Poll::Ready(self.inner.flush())
     }
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
